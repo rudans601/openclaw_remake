@@ -179,6 +179,31 @@ final class HealthStore {
         return nil
     }
 
+    private func resolvePrimaryChannel(
+        _ snap: HealthSnapshot) -> (id: String, summary: HealthSnapshot.ChannelSummary)?
+    {
+        if let link = self.resolveLinkChannel(snap) {
+            return link
+        }
+
+        let order = snap.channelOrder ?? Array(snap.channels.keys)
+        for id in order {
+            if let summary = snap.channels[id], summary.configured == true {
+                return (id: id, summary: summary)
+            }
+        }
+        for id in order {
+            if let summary = snap.channels[id] {
+                return (id: id, summary: summary)
+            }
+        }
+        return nil
+    }
+
+    private func channelLabel(_ id: String, in snap: HealthSnapshot) -> String {
+        snap.channelLabels?[id] ?? id.capitalized
+    }
+
     private func resolveFallbackChannel(
         _ snap: HealthSnapshot,
         excluding id: String?) -> (id: String, summary: HealthSnapshot.ChannelSummary)?
@@ -199,39 +224,58 @@ final class HealthStore {
             return .degraded(error)
         }
         guard let snap = self.snapshot else { return .unknown }
-        guard let link = self.resolveLinkChannel(snap) else { return .unknown }
-        if link.summary.linked != true {
+        guard let primary = self.resolvePrimaryChannel(snap) else {
+            return snap.ok == true ? .ok : .unknown
+        }
+        if primary.summary.linked == false {
             // Linking is optional if any other channel is healthy; don't paint the whole app red.
-            let fallback = self.resolveFallbackChannel(snap, excluding: link.id)
+            let fallback = self.resolveFallbackChannel(snap, excluding: primary.id)
             return fallback != nil ? .degraded("Not linked") : .linkingNeeded
         }
-        // A channel can be "linked" but still unhealthy (failed probe / cannot connect).
-        if let probe = link.summary.probe, probe.ok == false {
+        // Any primary channel can be unhealthy (failed probe / cannot connect).
+        if let probe = primary.summary.probe, probe.ok == false {
             return .degraded(Self.describeProbeFailure(probe))
         }
-        return .ok
+        if primary.summary.configured == true || snap.ok == true {
+            return .ok
+        }
+        return .unknown
     }
 
     var summaryLine: String {
         if self.isRefreshing { return "Health check running…" }
         if let error = self.lastError { return "Health check failed: \(error)" }
         guard let snap = self.snapshot else { return "Health check pending" }
-        guard let link = self.resolveLinkChannel(snap) else { return "Health check pending" }
-        if link.summary.linked != true {
-            if let fallback = self.resolveFallbackChannel(snap, excluding: link.id) {
+        guard let primary = self.resolvePrimaryChannel(snap) else {
+            return snap.ok == true ? "Gateway connected" : "Health check pending"
+        }
+        if primary.summary.linked == false {
+            if let fallback = self.resolveFallbackChannel(snap, excluding: primary.id) {
                 let fallbackLabel = snap.channelLabels?[fallback.id] ?? fallback.id.capitalized
                 let fallbackState = (fallback.summary.probe?.ok ?? true) ? "ok" : "degraded"
                 return "\(fallbackLabel) \(fallbackState) · Not linked — run openclaw login"
             }
             return "Not linked — run openclaw login"
         }
-        let auth = link.summary.authAgeMs.map { msToAge($0) } ?? "unknown"
-        if let probe = link.summary.probe, probe.ok == false {
+        if let probe = primary.summary.probe, probe.ok == false {
             let status = probe.status.map(String.init) ?? "?"
             let suffix = probe.status == nil ? "probe degraded" : "probe degraded · status \(status)"
-            return "linked · auth \(auth) · \(suffix)"
+            if primary.summary.linked == true {
+                let auth = primary.summary.authAgeMs.map { msToAge($0) } ?? "unknown"
+                return "linked · auth \(auth) · \(suffix)"
+            }
+            let label = self.channelLabel(primary.id, in: snap)
+            return "\(label) degraded · \(suffix)"
         }
-        return "linked · auth \(auth)"
+        if primary.summary.linked == true {
+            let auth = primary.summary.authAgeMs.map { msToAge($0) } ?? "unknown"
+            return "linked · auth \(auth)"
+        }
+        let label = self.channelLabel(primary.id, in: snap)
+        if primary.summary.configured == true {
+            return "\(label) ok"
+        }
+        return snap.ok == true ? "Gateway connected" : "Health check pending"
     }
 
     /// Short, human-friendly detail for the last failure, used in the UI.
@@ -252,11 +296,17 @@ final class HealthStore {
     }
 
     func describeFailure(from snap: HealthSnapshot, fallback: String?) -> String {
-        if let link = self.resolveLinkChannel(snap), link.summary.linked != true {
+        if let primary = self.resolvePrimaryChannel(snap), primary.summary.linked == false {
             return "Not linked — run openclaw login"
         }
-        if let link = self.resolveLinkChannel(snap), let probe = link.summary.probe, probe.ok == false {
+        if let primary = self.resolvePrimaryChannel(snap),
+           let probe = primary.summary.probe,
+           probe.ok == false
+        {
             return Self.describeProbeFailure(probe)
+        }
+        if snap.ok == true {
+            return "Gateway connected"
         }
         if let fallback, !fallback.isEmpty {
             return fallback

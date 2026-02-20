@@ -272,6 +272,90 @@ describe("cli program (nodes media)", () => {
     });
   });
 
+  it("runs nodes screen snapshot and prints MEDIA path", async () => {
+    mockNodeGateway("screen.snapshot", {
+      format: "jpeg",
+      base64: "aGk=",
+      width: 1280,
+      height: 720,
+      screenIndex: 0,
+    });
+
+    const program = buildProgram();
+    runtime.log.mockClear();
+    await program.parseAsync(
+      ["nodes", "screen", "snapshot", "--node", "ios-node", "--format", "jpeg"],
+      { from: "user" },
+    );
+
+    await expectLoggedSingleMediaFile({
+      expectedPathPattern: /openclaw-screen-snapshot-.*\.jpg$/,
+    });
+  });
+
+  it("runs nodes screen click and forwards coordinates", async () => {
+    mockNodeGateway("screen.click", { ok: true, x: 100, y: 200 });
+
+    const program = buildProgram();
+    runtime.log.mockClear();
+    await program.parseAsync(
+      [
+        "nodes",
+        "screen",
+        "click",
+        "--node",
+        "ios-node",
+        "--x",
+        "100",
+        "--y",
+        "200",
+        "--button",
+        "left",
+      ],
+      { from: "user" },
+    );
+
+    expect(callGateway).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "node.invoke",
+        params: expect.objectContaining({
+          nodeId: "ios-node",
+          command: "screen.click",
+          params: expect.objectContaining({
+            x: 100,
+            y: 200,
+            button: "left",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("runs nodes screen type and forwards text", async () => {
+    mockNodeGateway("screen.type", { ok: true, chars: 5, submit: true });
+
+    const program = buildProgram();
+    runtime.log.mockClear();
+    await program.parseAsync(
+      ["nodes", "screen", "type", "--node", "ios-node", "--text", "hello", "--submit"],
+      { from: "user" },
+    );
+
+    expect(callGateway).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "node.invoke",
+        params: expect.objectContaining({
+          nodeId: "ios-node",
+          command: "screen.type",
+          params: expect.objectContaining({
+            text: "hello",
+            submit: true,
+          }),
+        }),
+      }),
+    );
+  });
+
   it("fails nodes camera snap on invalid facing", async () => {
     mockNodeGateway();
 

@@ -137,6 +137,18 @@
           "label": "camera clip",
           "detailKeys": ["node", "nodeId", "facing", "duration", "durationMs"]
         },
+        "screen_snapshot": {
+          "label": "screen snapshot",
+          "detailKeys": ["node", "nodeId", "screenIndex", "outputFormat", "maxWidth"]
+        },
+        "screen_click": {
+          "label": "screen click",
+          "detailKeys": ["node", "nodeId", "x", "y", "button", "clickCount", "screenIndex"]
+        },
+        "screen_type": {
+          "label": "screen type",
+          "detailKeys": ["node", "nodeId", "text", "submit", "intervalMs", "screenIndex"]
+        },
         "screen_record": {
           "label": "screen record",
           "detailKeys": ["node", "nodeId", "duration", "durationMs", "fps", "screenIndex"]

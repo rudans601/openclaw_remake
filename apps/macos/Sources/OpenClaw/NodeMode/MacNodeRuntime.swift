@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import OpenClawIPC
 import OpenClawKit
+@preconcurrency import ScreenCaptureKit
 
 actor MacNodeRuntime {
     private let cameraCapture = CameraCaptureService()
@@ -56,6 +57,12 @@ actor MacNodeRuntime {
                 return try await self.handleCameraInvoke(req)
             case OpenClawLocationCommand.get.rawValue:
                 return try await self.handleLocationInvoke(req)
+            case MacNodeScreenCommand.snapshot.rawValue:
+                return try await self.handleScreenSnapshotInvoke(req)
+            case MacNodeScreenCommand.click.rawValue:
+                return try await self.handleScreenClickInvoke(req)
+            case MacNodeScreenCommand.type.rawValue:
+                return try await self.handleScreenTypeInvoke(req)
             case MacNodeScreenCommand.record.rawValue:
                 return try await self.handleScreenRecordInvoke(req)
             case OpenClawSystemCommand.run.rawValue:
@@ -294,6 +301,157 @@ actor MacNodeRuntime {
                     code: .unavailable,
                     message: "LOCATION_UNAVAILABLE: \(error.localizedDescription)"))
         }
+    }
+
+    private func handleScreenSnapshotInvoke(_ req: BridgeInvokeRequest) async throws -> BridgeInvokeResponse {
+        let params = (try? Self.decodeParams(MacNodeScreenSnapshotParams.self, from: req.paramsJSON)) ??
+            MacNodeScreenSnapshotParams()
+
+        let formatRaw = params.format?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "jpeg"
+        let format: OpenClawCanvasSnapshotFormat
+        switch formatRaw {
+        case "", "jpg", "jpeg":
+            format = .jpeg
+        case "png":
+            format = .png
+        default:
+            return Self.errorResponse(
+                req,
+                code: .invalidRequest,
+                message: "INVALID_REQUEST: snapshot format must be png|jpg|jpeg")
+        }
+
+        let maxWidth: Int? = {
+            if let raw = params.maxWidth, raw > 0 { return raw }
+            return switch format {
+            case .png: 900
+            case .jpeg: 1600
+            }
+        }()
+        let quality = params.quality ?? 0.85
+
+        let authorized = await PermissionManager.status([.screenRecording])[.screenRecording] ?? false
+        if !authorized {
+            return Self.errorResponse(req, code: .unavailable, message: "PERMISSION_MISSING: screenRecording")
+        }
+
+        let capture = try await Self.captureDisplayImage(screenIndex: params.screenIndex)
+        let encoded = try Self.encodeCanvasSnapshot(
+            image: capture.image,
+            format: format,
+            maxWidth: maxWidth,
+            quality: quality)
+        let dimensions = Self.imageDimensions(from: encoded)
+
+        struct ScreenSnapshotPayload: Encodable {
+            var format: String
+            var base64: String
+            var width: Int?
+            var height: Int?
+            var screenIndex: Int
+        }
+
+        let payload = try Self.encodePayload(ScreenSnapshotPayload(
+            format: format == .jpeg ? "jpeg" : "png",
+            base64: encoded.base64EncodedString(),
+            width: dimensions?.width,
+            height: dimensions?.height,
+            screenIndex: capture.screenIndex))
+        return BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: payload)
+    }
+
+    private func handleScreenClickInvoke(_ req: BridgeInvokeRequest) async throws -> BridgeInvokeResponse {
+        let params = try Self.decodeParams(MacNodeScreenClickParams.self, from: req.paramsJSON)
+        let accessibilityGranted = await PermissionManager.status([.accessibility])[.accessibility] ?? false
+        if !accessibilityGranted {
+            return Self.errorResponse(req, code: .unavailable, message: "PERMISSION_MISSING: accessibility")
+        }
+
+        let buttonRaw = params.button?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "left"
+        let button: CGMouseButton
+        let downType: CGEventType
+        let upType: CGEventType
+        switch buttonRaw {
+        case "left":
+            button = .left
+            downType = .leftMouseDown
+            upType = .leftMouseUp
+        case "right":
+            button = .right
+            downType = .rightMouseDown
+            upType = .rightMouseUp
+        case "middle":
+            button = .center
+            downType = .otherMouseDown
+            upType = .otherMouseUp
+        default:
+            return Self.errorResponse(req, code: .invalidRequest, message: "INVALID_REQUEST: button must be left|right|middle")
+        }
+
+        let point = CGPoint(x: params.x, y: params.y)
+        let clickCount = min(3, max(1, params.clickCount ?? 1))
+        let moveOnly = params.moveOnly ?? false
+        try await MainActor.run {
+            try Self.performMouseAction(
+                point: point,
+                button: button,
+                downType: downType,
+                upType: upType,
+                clickCount: clickCount,
+                moveOnly: moveOnly)
+        }
+
+        struct Payload: Encodable {
+            var ok: Bool
+            var x: Double
+            var y: Double
+            var button: String
+            var clickCount: Int
+            var moveOnly: Bool
+            var screenIndex: Int?
+        }
+        let payload = try Self.encodePayload(Payload(
+            ok: true,
+            x: params.x,
+            y: params.y,
+            button: buttonRaw,
+            clickCount: clickCount,
+            moveOnly: moveOnly,
+            screenIndex: params.screenIndex))
+        return BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: payload)
+    }
+
+    private func handleScreenTypeInvoke(_ req: BridgeInvokeRequest) async throws -> BridgeInvokeResponse {
+        let params = try Self.decodeParams(MacNodeScreenTypeParams.self, from: req.paramsJSON)
+        let text = params.text
+        if text.isEmpty {
+            return Self.errorResponse(req, code: .invalidRequest, message: "INVALID_REQUEST: text required")
+        }
+        let accessibilityGranted = await PermissionManager.status([.accessibility])[.accessibility] ?? false
+        if !accessibilityGranted {
+            return Self.errorResponse(req, code: .unavailable, message: "PERMISSION_MISSING: accessibility")
+        }
+
+        let submit = params.submit ?? false
+        let intervalMs = max(0, min(1000, params.intervalMs ?? 0))
+        try await MainActor.run {
+            try Self.performKeyboardTyping(text: text, intervalMs: intervalMs, submit: submit)
+        }
+
+        struct Payload: Encodable {
+            var ok: Bool
+            var chars: Int
+            var submit: Bool
+            var intervalMs: Double
+            var screenIndex: Int?
+        }
+        let payload = try Self.encodePayload(Payload(
+            ok: true,
+            chars: text.count,
+            submit: submit,
+            intervalMs: intervalMs,
+            screenIndex: params.screenIndex))
+        return BridgeInvokeResponse(id: req.id, ok: true, payloadJSON: payload)
     }
 
     private func handleScreenRecordInvoke(_ req: BridgeInvokeRequest) async throws -> BridgeInvokeResponse {
@@ -910,6 +1068,106 @@ extension MacNodeRuntime {
             id: req.id,
             ok: false,
             error: OpenClawNodeError(code: code, message: message))
+    }
+
+    private static func captureDisplayImage(screenIndex: Int?) async throws -> (image: NSImage, screenIndex: Int) {
+        let content = try await SCShareableContent.current
+        let displays = content.displays.sorted { $0.displayID < $1.displayID }
+        guard !displays.isEmpty else {
+            throw NSError(domain: "Screen", code: 32, userInfo: [
+                NSLocalizedDescriptionKey: "SCREEN_UNAVAILABLE: no active display",
+            ])
+        }
+
+        let requested = max(0, screenIndex ?? 0)
+        let clampedIndex = min(requested, displays.count - 1)
+        let display = displays[clampedIndex]
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let config = SCStreamConfiguration()
+        config.width = display.width
+        config.height = display.height
+        config.showsCursor = true
+
+        let cgImage = try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: config)
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        return (image, clampedIndex)
+    }
+
+    private static func imageDimensions(from data: Data) -> (width: Int, height: Int)? {
+        guard let rep = NSBitmapImageRep(data: data) else { return nil }
+        return (rep.pixelsWide, rep.pixelsHigh)
+    }
+
+    private static func performMouseAction(
+        point: CGPoint,
+        button: CGMouseButton,
+        downType: CGEventType,
+        upType: CGEventType,
+        clickCount: Int,
+        moveOnly: Bool) throws
+    {
+        CGWarpMouseCursorPosition(point)
+        if moveOnly {
+            return
+        }
+        for _ in 0..<clickCount {
+            guard let down = CGEvent(
+                mouseEventSource: nil,
+                mouseType: downType,
+                mouseCursorPosition: point,
+                mouseButton: button),
+                let up = CGEvent(
+                    mouseEventSource: nil,
+                    mouseType: upType,
+                    mouseCursorPosition: point,
+                    mouseButton: button)
+            else {
+                throw NSError(domain: "Screen", code: 34, userInfo: [
+                    NSLocalizedDescriptionKey: "SCREEN_CLICK_FAILED: could not create mouse event",
+                ])
+            }
+            down.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
+            up.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+            usleep(20_000)
+        }
+    }
+
+    private static func performKeyboardTyping(text: String, intervalMs: Double, submit: Bool) throws {
+        for character in text {
+            let chunk = String(character)
+            let unicode = Array(chunk.utf16)
+            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+            else {
+                throw NSError(domain: "Screen", code: 35, userInfo: [
+                    NSLocalizedDescriptionKey: "SCREEN_TYPE_FAILED: could not create keyboard event",
+                ])
+            }
+            down.keyboardSetUnicodeString(stringLength: unicode.count, unicodeString: unicode)
+            up.keyboardSetUnicodeString(stringLength: unicode.count, unicodeString: unicode)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+            if intervalMs > 0 {
+                usleep(useconds_t(intervalMs * 1000))
+            }
+        }
+        if submit {
+            let returnKeyCode: CGKeyCode = 36
+            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: returnKeyCode, keyDown: true),
+                let up = CGEvent(keyboardEventSource: nil, virtualKey: returnKeyCode, keyDown: false)
+            else {
+                throw NSError(domain: "Screen", code: 36, userInfo: [
+                    NSLocalizedDescriptionKey: "SCREEN_TYPE_FAILED: could not create return-key event",
+                ])
+            }
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
     }
 
     private static func encodeCanvasSnapshot(

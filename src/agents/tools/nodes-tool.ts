@@ -12,8 +12,11 @@ import {
 import { parseEnvPairs, parseTimeoutMs } from "../../cli/nodes-run.js";
 import {
   parseScreenRecordPayload,
+  parseScreenSnapshotPayload,
   screenRecordTempPath,
+  screenSnapshotTempPath,
   writeScreenRecordToFile,
+  writeScreenSnapshotToFile,
 } from "../../cli/nodes-screen.js";
 import { parseDurationMs } from "../../cli/parse-duration.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -22,7 +25,7 @@ import { resolveSessionAgentId } from "../agent-scope.js";
 import { resolveImageSanitizationLimits } from "../image-sanitization.js";
 import { optionalStringEnum, stringEnum } from "../schema/typebox.js";
 import { sanitizeToolResultImages } from "../tool-images.js";
-import { type AnyAgentTool, jsonResult, readStringParam } from "./common.js";
+import { type AnyAgentTool, imageResult, jsonResult, readStringParam } from "./common.js";
 import { callGatewayTool, readGatewayCallOptions } from "./gateway.js";
 import { listNodes, resolveNodeIdFromList, resolveNodeId } from "./nodes-utils.js";
 
@@ -36,6 +39,9 @@ const NODES_TOOL_ACTIONS = [
   "camera_snap",
   "camera_list",
   "camera_clip",
+  "screen_snapshot",
+  "screen_click",
+  "screen_type",
   "screen_record",
   "location_get",
   "run",
@@ -45,6 +51,8 @@ const NODES_TOOL_ACTIONS = [
 const NOTIFY_PRIORITIES = ["passive", "active", "timeSensitive"] as const;
 const NOTIFY_DELIVERIES = ["system", "overlay", "auto"] as const;
 const CAMERA_FACING = ["front", "back", "both"] as const;
+const SCREEN_SNAPSHOT_FORMATS = ["png", "jpg", "jpeg"] as const;
+const SCREEN_CLICK_BUTTONS = ["left", "right", "middle"] as const;
 const LOCATION_ACCURACY = ["coarse", "balanced", "precise"] as const;
 
 // Flattened schema: runtime validates per-action requirements.
@@ -73,6 +81,15 @@ const NodesToolSchema = Type.Object({
   durationMs: Type.Optional(Type.Number()),
   includeAudio: Type.Optional(Type.Boolean()),
   // screen_record
+  outputFormat: optionalStringEnum(SCREEN_SNAPSHOT_FORMATS),
+  x: Type.Optional(Type.Number()),
+  y: Type.Optional(Type.Number()),
+  button: optionalStringEnum(SCREEN_CLICK_BUTTONS),
+  clickCount: Type.Optional(Type.Number()),
+  moveOnly: Type.Optional(Type.Boolean()),
+  text: Type.Optional(Type.String()),
+  submit: Type.Optional(Type.Boolean()),
+  intervalMs: Type.Optional(Type.Number()),
   fps: Type.Optional(Type.Number()),
   screenIndex: Type.Optional(Type.Number()),
   outPath: Type.Optional(Type.String()),
@@ -92,6 +109,100 @@ const NodesToolSchema = Type.Object({
   invokeParamsJson: Type.Optional(Type.String()),
 });
 
+const SCREEN_OBSERVATION_TOKEN_CAP = 1024;
+const screenObservationTokens = new Map<string, number>();
+
+function screenObservationKey(params: { agentId?: string; sessionKey?: string }) {
+  const agent = params.agentId?.trim() || "unknown-agent";
+  const session = params.sessionKey?.trim() || "default-session";
+  return `${agent}:${session}`;
+}
+
+function grantScreenObservationToken(key: string) {
+  screenObservationTokens.set(key, 1);
+  if (screenObservationTokens.size > SCREEN_OBSERVATION_TOKEN_CAP) {
+    const oldestKey = screenObservationTokens.keys().next().value;
+    if (oldestKey) {
+      screenObservationTokens.delete(oldestKey);
+    }
+  }
+}
+
+function consumeScreenObservationToken(key: string): boolean {
+  const remaining = screenObservationTokens.get(key) ?? 0;
+  if (remaining <= 0) {
+    return false;
+  }
+  if (remaining <= 1) {
+    screenObservationTokens.delete(key);
+  } else {
+    screenObservationTokens.set(key, remaining - 1);
+  }
+  return true;
+}
+
+function resolveSnapshotFormat(outputFormat: unknown) {
+  const normalized = typeof outputFormat === "string" ? outputFormat.toLowerCase() : "jpeg";
+  if (normalized === "jpg" || normalized === "jpeg") {
+    return "jpeg" as const;
+  }
+  if (normalized === "png") {
+    return "png" as const;
+  }
+  throw new Error("invalid outputFormat (png|jpg|jpeg)");
+}
+
+async function captureNodeScreenSnapshotImage(params: {
+  gatewayOpts: ReturnType<typeof readGatewayCallOptions>;
+  nodeId: string;
+  format: "png" | "jpeg";
+  maxWidth?: number;
+  quality?: number;
+  screenIndex: number;
+  label: string;
+  imageSanitization: ReturnType<typeof resolveImageSanitizationLimits>;
+  extraText?: string;
+  extraDetails?: Record<string, unknown>;
+}) {
+  const raw = await callGatewayTool<{ payload: unknown }>("node.invoke", params.gatewayOpts, {
+    nodeId: params.nodeId,
+    command: "screen.snapshot",
+    params: {
+      format: params.format,
+      maxWidth: params.maxWidth,
+      quality: params.quality,
+      screenIndex: params.screenIndex,
+    },
+    idempotencyKey: crypto.randomUUID(),
+  });
+  const payload = parseScreenSnapshotPayload(raw?.payload);
+  const normalizedFormat = payload.format.toLowerCase();
+  if (normalizedFormat !== "jpg" && normalizedFormat !== "jpeg" && normalizedFormat !== "png") {
+    throw new Error(`unsupported screen.snapshot format: ${payload.format}`);
+  }
+
+  const isJpeg = normalizedFormat === "jpg" || normalizedFormat === "jpeg";
+  const filePath = screenSnapshotTempPath({
+    ext: isJpeg ? "jpg" : "png",
+  });
+  await writeScreenSnapshotToFile(filePath, payload.base64);
+  return await imageResult({
+    label: params.label,
+    path: filePath,
+    base64: payload.base64,
+    mimeType: imageMimeFromFormat(payload.format) ?? (isJpeg ? "image/jpeg" : "image/png"),
+    extraText: params.extraText,
+    details: {
+      format: payload.format,
+      width: payload.width,
+      height: payload.height,
+      screenIndex: payload.screenIndex ?? params.screenIndex,
+      ...params.extraDetails,
+    },
+    imageSanitization: params.imageSanitization,
+  });
+}
+
 export function createNodesTool(options?: {
   agentSessionKey?: string;
   config?: OpenClawConfig;
@@ -102,11 +213,12 @@ export function createNodesTool(options?: {
     config: options?.config,
   });
   const imageSanitization = resolveImageSanitizationLimits(options?.config);
+  const observationKey = screenObservationKey({ agentId, sessionKey });
   return {
     label: "Nodes",
     name: "nodes",
     description:
-      "Discover and control paired nodes (status/describe/pairing/notify/camera/screen/location/run/invoke).",
+      "Discover and control paired nodes (status/describe/pairing/notify/camera/screen snapshot/click/type/record/location/run/invoke).",
     parameters: NodesToolSchema,
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
@@ -319,6 +431,142 @@ export function createNodesTool(options?: {
                 hasAudio: payload.hasAudio,
               },
             };
+          }
+          case "screen_snapshot": {
+            const node = readStringParam(params, "node", { required: true });
+            const nodeId = await resolveNodeId(gatewayOpts, node);
+            const format = resolveSnapshotFormat(params.outputFormat);
+            const maxWidth =
+              typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)
+                ? params.maxWidth
+                : undefined;
+            const quality =
+              typeof params.quality === "number" && Number.isFinite(params.quality)
+                ? params.quality
+                : undefined;
+            const screenIndex =
+              typeof params.screenIndex === "number" && Number.isFinite(params.screenIndex)
+                ? params.screenIndex
+                : 0;
+            const result = await captureNodeScreenSnapshotImage({
+              gatewayOpts,
+              nodeId,
+              format,
+              maxWidth,
+              quality,
+              screenIndex,
+              label: "nodes:screen_snapshot",
+              imageSanitization,
+            });
+            grantScreenObservationToken(observationKey);
+            return result;
+          }
+          case "screen_click": {
+            const node = readStringParam(params, "node", { required: true });
+            const nodeId = await resolveNodeId(gatewayOpts, node);
+            const x =
+              typeof params.x === "number" && Number.isFinite(params.x) ? params.x : undefined;
+            const y =
+              typeof params.y === "number" && Number.isFinite(params.y) ? params.y : undefined;
+            if (x === undefined || y === undefined) {
+              throw new Error("x and y required");
+            }
+            const screenIndex =
+              typeof params.screenIndex === "number" && Number.isFinite(params.screenIndex)
+                ? params.screenIndex
+                : 0;
+            const button = typeof params.button === "string" ? params.button.toLowerCase() : "left";
+            if (button !== "left" && button !== "right" && button !== "middle") {
+              throw new Error("invalid button (left|right|middle)");
+            }
+            const clickCount =
+              typeof params.clickCount === "number" && Number.isFinite(params.clickCount)
+                ? Math.max(1, Math.trunc(params.clickCount))
+                : 1;
+            const moveOnly = typeof params.moveOnly === "boolean" ? params.moveOnly : false;
+
+            // Guardrail: screen-driving actions require a fresh explicit visual observation.
+            if (!consumeScreenObservationToken(observationKey)) {
+              const preflightResult = await captureNodeScreenSnapshotImage({
+                gatewayOpts,
+                nodeId,
+                format: "jpeg",
+                maxWidth: undefined,
+                quality: undefined,
+                screenIndex,
+                label: "nodes:screen_snapshot_preflight_click",
+                imageSanitization,
+                extraText:
+                  "PRECONDITION: click withheld until screen is observed. Review this snapshot, then retry screen_click.",
+                extraDetails: { preflight: true, pendingAction: "screen_click" },
+              });
+              grantScreenObservationToken(observationKey);
+              return preflightResult;
+            }
+
+            const raw = await callGatewayTool<{ payload?: unknown }>("node.invoke", gatewayOpts, {
+              nodeId,
+              command: "screen.click",
+              params: {
+                x,
+                y,
+                button,
+                clickCount,
+                moveOnly,
+                screenIndex,
+              },
+              idempotencyKey: crypto.randomUUID(),
+            });
+            return jsonResult(raw?.payload ?? { ok: true });
+          }
+          case "screen_type": {
+            const node = readStringParam(params, "node", { required: true });
+            const nodeId = await resolveNodeId(gatewayOpts, node);
+            const text = readStringParam(params, "text", { required: true, allowEmpty: true });
+            if (!text) {
+              throw new Error("text required");
+            }
+            const screenIndex =
+              typeof params.screenIndex === "number" && Number.isFinite(params.screenIndex)
+                ? params.screenIndex
+                : 0;
+            const submit = typeof params.submit === "boolean" ? params.submit : false;
+            const intervalMs =
+              typeof params.intervalMs === "number" && Number.isFinite(params.intervalMs)
+                ? params.intervalMs
+                : undefined;
+
+            // Guardrail: screen-driving actions require a fresh explicit visual observation.
+            if (!consumeScreenObservationToken(observationKey)) {
+              const preflightResult = await captureNodeScreenSnapshotImage({
+                gatewayOpts,
+                nodeId,
+                format: "jpeg",
+                maxWidth: undefined,
+                quality: undefined,
+                screenIndex,
+                label: "nodes:screen_snapshot_preflight_type",
+                imageSanitization,
+                extraText:
+                  "PRECONDITION: typing withheld until screen is observed. Review this snapshot, then retry screen_type.",
+                extraDetails: { preflight: true, pendingAction: "screen_type" },
+              });
+              grantScreenObservationToken(observationKey);
+              return preflightResult;
+            }
+
+            const raw = await callGatewayTool<{ payload?: unknown }>("node.invoke", gatewayOpts, {
+              nodeId,
+              command: "screen.type",
+              params: {
+                text,
+                submit,
+                intervalMs,
+                screenIndex,
+              },
+              idempotencyKey: crypto.randomUUID(),
+            });
+            return jsonResult(raw?.payload ?? { ok: true });
           }
           case "screen_record": {
             const node = readStringParam(params, "node", { required: true });

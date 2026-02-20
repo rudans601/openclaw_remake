@@ -277,22 +277,40 @@ public actor GatewayChannelActor {
 
     private func startKeepalive() {
         self.keepaliveTask?.cancel()
+        guard self.shouldRunKeepalive else {
+            self.keepaliveTask = nil
+            return
+        }
         self.keepaliveTask = Task { [weak self] in
             guard let self else { return }
             await self.keepaliveLoop()
         }
     }
 
+    private var shouldRunKeepalive: Bool {
+        let role = self.connectOptions?.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Node-role clients are subscribed to gateway tick events and cannot call `health`.
+        // Running keepalive there only creates unauthorized spam.
+        return role != "node"
+    }
+
     private func keepaliveLoop() async {
-        while self.shouldReconnect {
-            try? await Task.sleep(nanoseconds: UInt64(self.keepaliveIntervalSeconds * 1_000_000_000))
+        while self.shouldReconnect && !Task.isCancelled {
+            do {
+                try await Task.sleep(nanoseconds: UInt64(self.keepaliveIntervalSeconds * 1_000_000_000))
+            } catch {
+                // Cancellation is expected when reconnecting/shutting down.
+                return
+            }
             guard self.shouldReconnect else { return }
+            guard !Task.isCancelled else { return }
             guard self.connected else { continue }
             // Best-effort outbound message to keep intermediate NAT/proxy state alive.
             // We intentionally ignore the response.
             do {
                 try await self.send(method: "health", params: nil)
             } catch {
+                if Task.isCancelled { return }
                 // Avoid spamming logs; the reconnect paths will surface meaningful errors.
             }
         }

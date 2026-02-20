@@ -9,7 +9,12 @@ import {
   writeBase64ToFile,
   writeUrlToFile,
 } from "./nodes-camera.js";
-import { parseScreenRecordPayload, screenRecordTempPath } from "./nodes-screen.js";
+import {
+  parseScreenRecordPayload,
+  parseScreenSnapshotPayload,
+  screenRecordTempPath,
+  screenSnapshotTempPath,
+} from "./nodes-screen.js";
 
 describe("nodes camera helpers", () => {
   it("parses camera.snap payload", () => {
@@ -145,6 +150,27 @@ describe("nodes screen helpers", () => {
     );
   });
 
+  it("parses screen.snapshot payload", () => {
+    const payload = parseScreenSnapshotPayload({
+      format: "jpeg",
+      base64: "Zm9v",
+      width: 640,
+      height: 360,
+      screenIndex: 1,
+    });
+    expect(payload.format).toBe("jpeg");
+    expect(payload.base64).toBe("Zm9v");
+    expect(payload.width).toBe(640);
+    expect(payload.height).toBe(360);
+    expect(payload.screenIndex).toBe(1);
+  });
+
+  it("rejects invalid screen.snapshot payload", () => {
+    expect(() => parseScreenSnapshotPayload({ format: "jpeg" })).toThrow(
+      /invalid screen\.snapshot payload/i,
+    );
+  });
+
   it("builds screen record temp path", () => {
     const p = screenRecordTempPath({
       ext: "mp4",
@@ -152,5 +178,14 @@ describe("nodes screen helpers", () => {
       id: "id1",
     });
     expect(p).toBe(path.join("/tmp", "openclaw-screen-record-id1.mp4"));
+  });
+
+  it("builds screen snapshot temp path", () => {
+    const p = screenSnapshotTempPath({
+      ext: "jpg",
+      tmpDir: "/tmp",
+      id: "id1",
+    });
+    expect(p).toBe(path.join("/tmp", "openclaw-screen-snapshot-id1.jpg"));
   });
 });

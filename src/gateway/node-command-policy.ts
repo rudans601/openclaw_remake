@@ -15,7 +15,12 @@ const CANVAS_COMMANDS = [
 const CAMERA_COMMANDS = ["camera.list"];
 const CAMERA_DANGEROUS_COMMANDS = ["camera.snap", "camera.clip"];
 
-const SCREEN_DANGEROUS_COMMANDS = ["screen.record"];
+const SCREEN_DANGEROUS_COMMANDS = [
+  "screen.record",
+  "screen.snapshot",
+  "screen.click",
+  "screen.type",
+];
 
 const LOCATION_COMMANDS = ["location.get"];
 

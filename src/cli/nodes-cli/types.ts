@@ -41,6 +41,11 @@ export type NodesRpcOpts = {
   screen?: string;
   fps?: string;
   audio?: boolean;
+  button?: string;
+  count?: string;
+  moveOnly?: boolean;
+  submit?: boolean;
+  intervalMs?: string;
 };
 
 export type {

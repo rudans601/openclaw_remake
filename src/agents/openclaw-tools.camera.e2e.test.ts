@@ -20,16 +20,19 @@ function unexpectedGatewayMethod(method: unknown): never {
   throw new Error(`unexpected method: ${String(method)}`);
 }
 
-function getNodesTool() {
-  const tool = createOpenClawTools().find((candidate) => candidate.name === "nodes");
+function getNodesTool(agentSessionKey?: string) {
+  const tool = createOpenClawTools({ agentSessionKey }).find(
+    (candidate) => candidate.name === "nodes",
+  );
   if (!tool) {
     throw new Error("missing nodes tool");
   }
   return tool;
 }
 
-async function executeNodes(input: Record<string, unknown>) {
-  return getNodesTool().execute("call1", input as never);
+async function executeNodes(input: Record<string, unknown>, opts?: { sessionKey?: string }) {
+  const sessionKey = opts?.sessionKey ?? `test-${Date.now()}-${Math.random()}`;
+  return getNodesTool(sessionKey).execute("call1", input as never);
 }
 
 function mockNodeList(commands?: string[]) {
@@ -100,6 +103,214 @@ describe("nodes camera_snap", () => {
       facing: "front",
       deviceId: "cam-123",
     });
+  });
+});
+
+describe("nodes screen_snapshot", () => {
+  it("maps jpeg payloads to image/jpeg", async () => {
+    callGateway.mockImplementation(async ({ method }) => {
+      if (method === "node.list") {
+        return mockNodeList();
+      }
+      if (method === "node.invoke") {
+        return {
+          payload: {
+            format: "jpeg",
+            base64: "aGVsbG8=",
+            width: 1,
+            height: 1,
+            screenIndex: 0,
+          },
+        };
+      }
+      return unexpectedGatewayMethod(method);
+    });
+
+    const result = await executeNodes({
+      action: "screen_snapshot",
+      node: NODE_ID,
+      outputFormat: "jpeg",
+      screenIndex: 0,
+    });
+
+    const images = (result.content ?? []).filter((block) => block.type === "image");
+    expect(images).toHaveLength(1);
+    expect(images[0]?.mimeType).toBe("image/jpeg");
+  });
+
+  it("normalizes jpg output format to jpeg", async () => {
+    callGateway.mockImplementation(async ({ method, params }) => {
+      if (method === "node.list") {
+        return mockNodeList();
+      }
+      if (method === "node.invoke") {
+        expect(params).toMatchObject({
+          command: "screen.snapshot",
+          params: {
+            format: "jpeg",
+            screenIndex: 1,
+          },
+        });
+        return {
+          payload: {
+            format: "jpg",
+            base64: "aGVsbG8=",
+            width: 1,
+            height: 1,
+            screenIndex: 1,
+          },
+        };
+      }
+      return unexpectedGatewayMethod(method);
+    });
+
+    await executeNodes({
+      action: "screen_snapshot",
+      node: NODE_ID,
+      outputFormat: "jpg",
+      screenIndex: 1,
+    });
+  });
+});
+
+describe("nodes screen_click and screen_type", () => {
+  it("returns a preflight snapshot when click is requested without fresh observation", async () => {
+    const invokeCommands: string[] = [];
+    callGateway.mockImplementation(async ({ method, params }) => {
+      if (method === "node.list") {
+        return mockNodeList(["screen.snapshot", "screen.click", "screen.type"]);
+      }
+      if (method === "node.invoke") {
+        const rawCommand = (params as { command?: unknown })?.command;
+        const command = typeof rawCommand === "string" ? rawCommand : "";
+        invokeCommands.push(command);
+        if (command === "screen.snapshot") {
+          return {
+            payload: {
+              format: "jpeg",
+              base64: "aGVsbG8=",
+              width: 1,
+              height: 1,
+              screenIndex: 0,
+            },
+          };
+        }
+        if (command === "screen.click") {
+          return { payload: { ok: true } };
+        }
+      }
+      return unexpectedGatewayMethod(method);
+    });
+
+    const result = await executeNodes(
+      {
+        action: "screen_click",
+        node: NODE_ID,
+        x: 100,
+        y: 200,
+      },
+      { sessionKey: "screen-preflight-click" },
+    );
+
+    expect(invokeCommands).toEqual(["screen.snapshot"]);
+    const textBlocks = (result.content ?? [])
+      .filter((block) => block.type === "text")
+      .map((block) => block.text);
+    expect(textBlocks.join("\n")).toContain("PRECONDITION:");
+  });
+
+  it("executes click after a snapshot in the same session", async () => {
+    const invokeCommands: string[] = [];
+    callGateway.mockImplementation(async ({ method, params }) => {
+      if (method === "node.list") {
+        return mockNodeList(["screen.snapshot", "screen.click"]);
+      }
+      if (method === "node.invoke") {
+        const rawCommand = (params as { command?: unknown })?.command;
+        const command = typeof rawCommand === "string" ? rawCommand : "";
+        invokeCommands.push(command);
+        if (command === "screen.snapshot") {
+          return {
+            payload: {
+              format: "jpeg",
+              base64: "aGVsbG8=",
+              width: 1,
+              height: 1,
+              screenIndex: 0,
+            },
+          };
+        }
+        if (command === "screen.click") {
+          expect(params).toMatchObject({
+            command: "screen.click",
+            params: { x: 10, y: 20, button: "left" },
+          });
+          return { payload: { ok: true } };
+        }
+      }
+      return unexpectedGatewayMethod(method);
+    });
+
+    const sessionKey = "screen-click-ready";
+    await executeNodes(
+      { action: "screen_snapshot", node: NODE_ID, screenIndex: 0 },
+      { sessionKey },
+    );
+    invokeCommands.length = 0;
+    await executeNodes(
+      {
+        action: "screen_click",
+        node: NODE_ID,
+        x: 10,
+        y: 20,
+      },
+      { sessionKey },
+    );
+    expect(invokeCommands).toEqual(["screen.click"]);
+  });
+
+  it("returns a preflight snapshot when typing is requested without fresh observation", async () => {
+    const invokeCommands: string[] = [];
+    callGateway.mockImplementation(async ({ method, params }) => {
+      if (method === "node.list") {
+        return mockNodeList(["screen.snapshot", "screen.type"]);
+      }
+      if (method === "node.invoke") {
+        const rawCommand = (params as { command?: unknown })?.command;
+        const command = typeof rawCommand === "string" ? rawCommand : "";
+        invokeCommands.push(command);
+        if (command === "screen.snapshot") {
+          return {
+            payload: {
+              format: "jpeg",
+              base64: "aGVsbG8=",
+              width: 1,
+              height: 1,
+              screenIndex: 0,
+            },
+          };
+        }
+        if (command === "screen.type") {
+          return { payload: { ok: true } };
+        }
+      }
+      return unexpectedGatewayMethod(method);
+    });
+
+    const result = await executeNodes(
+      {
+        action: "screen_type",
+        node: NODE_ID,
+        text: "hello",
+      },
+      { sessionKey: "screen-preflight-type" },
+    );
+
+    expect(invokeCommands).toEqual(["screen.snapshot"]);
+    const textBlocks = (result.content ?? [])
+      .filter((block) => block.type === "text")
+      .map((block) => block.text);
+    expect(textBlocks.join("\n")).toContain("PRECONDITION:");
   });
 });
 

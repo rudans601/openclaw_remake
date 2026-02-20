@@ -12,6 +12,14 @@ export type ScreenRecordPayload = {
   hasAudio?: boolean;
 };
 
+export type ScreenSnapshotPayload = {
+  format: string;
+  base64: string;
+  width?: number;
+  height?: number;
+  screenIndex?: number;
+};
+
 function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
@@ -37,6 +45,22 @@ export function parseScreenRecordPayload(value: unknown): ScreenRecordPayload {
   };
 }
 
+export function parseScreenSnapshotPayload(value: unknown): ScreenSnapshotPayload {
+  const obj = asRecord(value);
+  const format = asString(obj.format);
+  const base64 = asString(obj.base64);
+  if (!format || !base64) {
+    throw new Error("invalid screen.snapshot payload");
+  }
+  return {
+    format,
+    base64,
+    width: typeof obj.width === "number" ? obj.width : undefined,
+    height: typeof obj.height === "number" ? obj.height : undefined,
+    screenIndex: typeof obj.screenIndex === "number" ? obj.screenIndex : undefined,
+  };
+}
+
 export function screenRecordTempPath(opts: { ext: string; tmpDir?: string; id?: string }) {
   const tmpDir = opts.tmpDir ?? os.tmpdir();
   const id = opts.id ?? randomUUID();
@@ -44,6 +68,17 @@ export function screenRecordTempPath(opts: { ext: string; tmpDir?: string; id?: 
   return path.join(tmpDir, `openclaw-screen-record-${id}${ext}`);
 }
 
+export function screenSnapshotTempPath(opts: { ext: string; tmpDir?: string; id?: string }) {
+  const tmpDir = opts.tmpDir ?? os.tmpdir();
+  const id = opts.id ?? randomUUID();
+  const ext = opts.ext.startsWith(".") ? opts.ext : `.${opts.ext}`;
+  return path.join(tmpDir, `openclaw-screen-snapshot-${id}${ext}`);
+}
+
 export async function writeScreenRecordToFile(filePath: string, base64: string) {
+  return writeBase64ToFile(filePath, base64);
+}
+
+export async function writeScreenSnapshotToFile(filePath: string, base64: string) {
   return writeBase64ToFile(filePath, base64);
 }
